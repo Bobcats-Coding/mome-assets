@@ -1,0 +1,613 @@
+<html lang="hu"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTML Struktúra Diagram</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 40px 20px;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 40px;
+            font-size: 2em;
+        }
+        
+        .diagram {
+            position: relative;
+        }
+        
+        .element {
+            background: white;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            padding: 12px 20px;
+            margin: 10px 0;
+            transition: all 0.3s ease;
+            cursor: pointer;
+            position: relative;
+        }
+        
+        .element:hover {
+            transform: translateX(5px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            border-color: #667eea;
+        }
+        
+        .element-name {
+            font-family: 'Courier New', monospace;
+            font-weight: bold;
+            color: #e83e8c;
+            font-size: 14px;
+        }
+        
+        .element-desc {
+            color: #666;
+            font-size: 13px;
+            margin-top: 4px;
+        }
+        
+        .level-1 {
+            background: #fff3cd;
+            border-color: #ffc107;
+        }
+        
+        .level-2 {
+            background: #d1ecf1;
+            border-color: #17a2b8;
+            margin-left: 40px;
+        }
+        
+        .level-3 {
+            background: #d4edda;
+            border-color: #28a745;
+            margin-left: 80px;
+        }
+        
+        .level-4 {
+            background: #f8d7da;
+            border-color: #dc3545;
+            margin-left: 120px;
+        }
+        
+        .level-5 {
+            background: #e2e3e5;
+            border-color: #6c757d;
+            margin-left: 160px;
+        }
+        
+        .group {
+            margin: 20px 0;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 12px;
+        }
+        
+        .group-title {
+            font-weight: bold;
+            color: #495057;
+            margin-bottom: 15px;
+            font-size: 16px;
+        }
+        
+        .legend {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            margin-top: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 12px;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .legend-box {
+            width: 30px;
+            height: 30px;
+            border-radius: 4px;
+            border: 2px solid;
+        }
+        
+        .note {
+            background: #e7f3ff;
+            border-left: 4px solid #2196F3;
+            padding: 15px;
+            margin-top: 20px;
+            border-radius: 4px;
+            font-size: 14px;
+            color: #333;
+        }
+        
+        #downloadBtn {
+            transition: all 0.3s ease;
+        }
+        
+        #downloadBtn:hover {
+            transform: translateY(-2px);
+        }
+        
+        #downloadBtn:active {
+            transform: translateY(0);
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html">
+    <div class="container">
+        <h1>📄 Tipikus weboldal HTML struktúrája</h1>
+        
+        <div style="text-align: center; margin-bottom: 30px;">
+            <button id="downloadBtn" style="background: rgb(102, 126, 234); color: white; border: none; padding: 12px 30px; border-radius: 8px; font-size: 16px; cursor: pointer; font-weight: 600; box-shadow: rgba(102, 126, 234, 0.4) 0px 6px 20px; transition: 0.3s; transform: translateY(-2px);">
+                ⬇️ Diagram letöltése HTML-ként
+            </button>
+        </div>
+        
+        <div class="diagram">
+            <div class="element level-1">
+                <div class="element-name">&lt;html&gt;</div>
+                <div class="element-desc">A teljes dokumentum</div>
+            </div>
+            
+            <div class="group">
+                <div class="element level-2">
+                    <div class="element-name">&lt;head&gt;</div>
+                    <div class="element-desc">Meta információk (nem látható)</div>
+                </div>
+                
+                <div class="element level-3">
+                    <div class="element-name">&lt;title&gt;</div>
+                    <div class="element-desc">Oldal címe a böngésző fülön</div>
+                </div>
+                
+                <div class="element level-3">
+                    <div class="element-name">&lt;meta&gt;</div>
+                    <div class="element-desc">Leírás, kulcsszavak, viewport</div>
+                </div>
+            </div>
+            
+            <div class="group">
+                <div class="element level-2">
+                    <div class="element-name">&lt;body&gt;</div>
+                    <div class="element-desc">A látható tartalom kezdődik itt</div>
+                </div>
+                
+                <div class="element level-3">
+                    <div class="element-name">&lt;header&gt;</div>
+                    <div class="element-desc">Oldal fejléce (logó, navigáció)</div>
+                </div>
+                
+                <div class="element level-4">
+                    <div class="element-name">&lt;nav&gt;</div>
+                    <div class="element-desc">Navigációs menü</div>
+                </div>
+                
+                <div class="element level-5">
+                    <div class="element-name">&lt;ul&gt; + &lt;li&gt; + &lt;a&gt;</div>
+                    <div class="element-desc">Lista menüpontokkal és linkekkel</div>
+                </div>
+                
+                <div class="element level-3">
+                    <div class="element-name">&lt;main&gt;</div>
+                    <div class="element-desc">Fő tartalom (csak 1 lehet)</div>
+                </div>
+                
+                <div class="element level-4">
+                    <div class="element-name">&lt;section&gt;</div>
+                    <div class="element-desc">Tematikus szekció</div>
+                </div>
+                
+                <div class="element level-5">
+                    <div class="element-name">&lt;h1&gt;, &lt;h2&gt;</div>
+                    <div class="element-desc">Címsorok</div>
+                </div>
+                
+                <div class="element level-5">
+                    <div class="element-name">&lt;p&gt;</div>
+                    <div class="element-desc">Bekezdések szöveggel</div>
+                </div>
+                
+                <div class="element level-5">
+                    <div class="element-name">&lt;img&gt;</div>
+                    <div class="element-desc">Képek</div>
+                </div>
+                
+                <div class="element level-4">
+                    <div class="element-name">&lt;article&gt;</div>
+                    <div class="element-desc">Önálló tartalmi egység (blogposzt)</div>
+                </div>
+                
+                <div class="element level-5">
+                    <div class="element-name">&lt;h2&gt;</div>
+                    <div class="element-desc">Cikk címe</div>
+                </div>
+                
+                <div class="element level-5">
+                    <div class="element-name">&lt;p&gt;</div>
+                    <div class="element-desc">Cikk szövege</div>
+                </div>
+                
+                <div class="element level-3">
+                    <div class="element-name">&lt;aside&gt;</div>
+                    <div class="element-desc">Oldalsáv / kapcsolódó tartalom</div>
+                </div>
+                
+                <div class="element level-3">
+                    <div class="element-name">&lt;footer&gt;</div>
+                    <div class="element-desc">Lábléc (kapcsolat, copyright)</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="legend">
+            <div class="legend-item">
+                <div class="legend-box level-1"></div>
+                <span>Gyökér elem</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-box level-2"></div>
+                <span>Fő struktúra</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-box level-3"></div>
+                <span>Szemantikus elemek</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-box level-4"></div>
+                <span>Tartalom konténerek</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-box level-5"></div>
+                <span>Tartalom elemek</span>
+            </div>
+        </div>
+        
+        <div class="note">
+            <strong>💡 Tipp designereknek:</strong> Ez a hierarchia segít megérteni, hogyan épül fel egy weboldal "csontváza". Minden elem a megfelelő helyen kell legyen - mint egy orosz babában, minden elem a szülőjében van. A CSS később majd az elrendezést változtathatja, de a HTML struktúra marad a logikus alap.
+        </div>
+    </div>
+    
+    <script>
+        document.getElementById('downloadBtn').addEventListener('click', function() {
+            const htmlContent = document.documentElement.outerHTML;
+            const blob = new Blob([htmlContent], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'html-struktura-diagram.html';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            // Visual feedback
+            this.textContent = '✅ Letöltve!';
+            this.style.background = '#28a745';
+            setTimeout(() => {
+                this.textContent = '⬇️ Diagram letöltése HTML-ként';
+                this.style.background = '#667eea';
+            }, 2000);
+        });
+        
+        // Hover effect for button
+        const btn = document.getElementById('downloadBtn');
+        btn.addEventListener('mouseenter', function() {
+            this.style.transform = 'translateY(-2px)';
+            this.style.boxShadow = '0 6px 20px rgba(102, 126, 234, 0.4)';
+        });
+        btn.addEventListener('mouseleave', function() {
+            this.style.transform = 'translateY(0)';
+            this.style.boxShadow = '0 4px 12px rgba(102, 126, 234, 0.3)';
+        });
+    </script>
+
+</body></html>
